@@ -42,21 +42,20 @@ class NeuronPopulation:
 
     def step(self, external_current: np.ndarray, t: float, noise_amplitude: float = 5.0):
         """Advance one timestep. Returns boolean array of which neurons fired."""
-        # Add thalamic noise + external input
-        noise = np.random.randn(self.n) * noise_amplitude
-        total_I = self.I + external_current + noise
-
         # Reset input accumulator
         self.I = np.zeros(self.n)
 
-        # Apply refractory period
+        # Refractory period: zero current for neurons currently in refractory
         in_refractory = self.refractory > 0
-        total_I[in_refractory] = 0
         self.refractory = np.maximum(0, self.refractory - self.dt)
 
         # Izhikevich model update (0.5ms substeps for numerical stability)
         for _ in range(2):
-            dv = (0.04 * self.v ** 2 + 5 * self.v + 140 - self.u + total_I) * (self.dt / 2)
+            # Each substep gets its own noise realization (stochastic ODE discretization)
+            noise = np.random.randn(self.n) * noise_amplitude
+            sub_I = self.I + external_current + noise
+            sub_I[in_refractory] = 0  # apply refractory mask to each substep
+            dv = (0.04 * self.v ** 2 + 5 * self.v + 140 - self.u + sub_I) * (self.dt / 2)
             du = self.a * (self.b * self.v - self.u) * (self.dt / 2)
             self.v += dv
             self.u += du
