@@ -26,12 +26,13 @@ class SynapseMatrix:
             self.nnz = 0
             return
 
-        # Random pre/post pairs
-        pre_idx = np.random.randint(0, n_pre, nnz)
-        post_idx = np.random.randint(0, n_post, nnz)
+        # Random pre/post pairs (using seeded RNG for reproducibility)
+        rng = BrainConfig.get_rng()
+        pre_idx = rng.integers(0, n_pre, nnz)
+        post_idx = rng.integers(0, n_post, nnz)
 
         # Initial weights (log-normal distribution for biological realism)
-        weights = np.random.lognormal(
+        weights = rng.lognormal(
             mean=np.log(w_init_mean), sigma=w_init_std, size=nnz
         ).astype(np.float32)
         weights = np.clip(weights, BrainConfig.STDP_W_MIN, BrainConfig.STDP_W_MAX)

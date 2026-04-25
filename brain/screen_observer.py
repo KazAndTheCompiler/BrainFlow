@@ -180,6 +180,12 @@ class ScreenObserver:
         window_title = self._get_window_title()
 
         # --- Screen UI pipeline (semantic, preferred) ---
+        # --- P1: Privacy Filter ---
+        # Check if window title contains excluded keywords (password managers, etc.)
+        if self._should_exclude_window(window_title):
+            logger.info(f"[SCREEN] Skipping excluded window: {window_title[:50]}...")
+            return
+
         if self.screen_ui_engine is not None:
             try:
                 changed = self.screen_ui_engine.has_screen_changed(screenshot)
@@ -193,7 +199,10 @@ class ScreenObserver:
                 )
                 self._last_ui_layout = layout
                 self._text_changes += 1
-                self._total_text_extracted += len(layout.full_text)
+                
+                # P1: Redact PII from extracted text
+                redacted_text = self._redact_sensitive_info(layout.full_text)
+                self._total_text_extracted += len(redacted_text)
                 self._last_window_title = window_title
 
                 encoded = self.screen_ui_engine.encode_for_brain(layout)
@@ -213,14 +222,15 @@ class ScreenObserver:
                         1.0, self.brain.neuromodulators.get("norepinephrine", 0.3) + 0.05
                     )
 
-                if self.knowledge_store and len(layout.full_text) >= 30:
+                # P1: Store redacted text only
+                if self.knowledge_store and len(redacted_text) >= 30:
                     tags = ["screen", "ui_analysis"]
                     if window_title:
                         tags.append(self._window_to_tag(window_title))
                     if layout.dominant_type.value != "unknown":
                         tags.append(layout.dominant_type.value)
                     self.knowledge_store.store(
-                        text=layout.full_text[:5000],
+                        text=redacted_text[:5000],
                         source="screen_ui",
                         tags=tags,
                         metadata={
@@ -229,6 +239,7 @@ class ScreenObserver:
                             "region_count": len(layout.regions),
                             "dominant_type": layout.dominant_type.value,
                             "summary": encoded["summary"],
+                            "redacted": redacted_text != layout.full_text,
                         }
                     )
 
@@ -236,7 +247,7 @@ class ScreenObserver:
                 return
 
             except Exception as e:
-                print(f"[SCREEN] UI analysis error, falling back: {e}")
+                logger.error(f"[SCREEN] UI analysis error, falling back: {e}", exc_info=True)
 
         # --- Fallback: motion detection + simple OCR ---
         small = screenshot.resize((64, 48), Image.LANCZOS)
@@ -335,6 +346,52 @@ class ScreenObserver:
                 continue
             cleaned.append(line)
         return "\n".join(cleaned)
+
+    def _should_exclude_window(self, window_title: str) -> bool:
+        """
+        P1: Privacy filter - check if window should be excluded from capture.
+        
+        Excludes password managers, login screens, and other sensitive windows.
+        """
+        from brain.config import BrainConfig
+        
+        if not window_title:
+            return False
+            
+        title_lower = window_title.lower()
+        
+        for excluded in BrainConfig.SCREEN_EXCLUDED_TITLES:
+            if excluded.strip() and excluded in title_lower:
+                return True
+        
+        return False
+    
+    def _redact_sensitive_info(self, text: str) -> str:
+        """
+        P1: Privacy filter - redact PII and sensitive information from OCR text.
+        
+        Redacts:
+        - Credit card numbers
+        - Social Security numbers
+        - Email addresses
+        - Passwords, secrets, tokens, keys
+        """
+        from brain.config import BrainConfig
+        import re
+        
+        if not text:
+            return text
+            
+        redacted = text
+        
+        for pattern in BrainConfig.SCREEN_REDACT_PATTERNS:
+            try:
+                redacted = re.sub(pattern, '[REDACTED]', redacted, flags=re.IGNORECASE)
+            except re.error:
+                # Skip invalid patterns
+                continue
+        
+        return redacted
 
     def _window_to_tag(self, title):
         """Extract clean tag from window title."""

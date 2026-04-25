@@ -9,6 +9,7 @@ SAFETY FEATURES:
 - Keeps the last 10 backups rolling
 - If load fails due to neuron mismatch, save is PRESERVED (never overwritten)
 - Update-safe: brain_state folder is separate from code - updates never touch it
+- Schema validation on load to prevent corruption
 """
 
 import os
@@ -16,8 +17,87 @@ import sys
 import json
 import time
 import shutil
+import hashlib
 import numpy as np
 from scipy import sparse
+from typing import Dict, Any, List, Optional
+
+# Schema version for backward compatibility
+SCHEMA_VERSION = "1.0.0"
+
+# P1: Schema migration table
+# Maps (from_version, to_version) -> migration function
+# Example: MIGRATIONS[("1.0.0", "1.1.0")] = migrate_1_0_0_to_1_1_0
+MIGRATIONS = {}
+
+def register_migration(from_ver: str, to_ver: str):
+    """Decorator to register a schema migration function."""
+    def decorator(func):
+        MIGRATIONS[(from_ver, to_ver)] = func
+        return func
+    return decorator
+
+@register_migration("1.0.0", "1.1.0")
+def migrate_1_0_0_to_1_1_0(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Example migration: Add new field with default.
+    
+    In real usage, this would transform the meta dict
+    to match the new schema version.
+    """
+    meta["new_field"] = "default_value"
+    return meta
+
+def migrate_schema(meta: Dict[str, Any], target_version: str = SCHEMA_VERSION) -> Dict[str, Any]:
+    """
+    P1: Migrate meta dict from its current version to target_version.
+    
+    Args:
+        meta: The meta dict loaded from file
+        target_version: The schema version to migrate to
+        
+    Returns:
+        Migrated meta dict
+        
+    Raises:
+        ValueError: If no migration path exists
+    """
+    current_version = meta.get("schema_version", "1.0.0")
+    
+    if current_version == target_version:
+        return meta
+    
+    # Simple linear migration path
+    # In production, you'd want a proper graph traversal
+    migration_key = (current_version, target_version)
+    
+    if migration_key not in MIGRATIONS:
+        raise ValueError(
+            f"No migration path from {current_version} to {target_version}. "
+            f"Available migrations: {list(MIGRATIONS.keys())}"
+        )
+    
+    migration_func = MIGRATIONS[migration_key]
+    migrated = migration_func(meta.copy())
+    migrated["schema_version"] = target_version
+    
+    return migrated
+
+# Required fields in meta.json
+REQUIRED_META_FIELDS = {
+    "step_count": int,
+    "total_neurons": int,
+    "development_stage": str,
+    "neuromodulators": dict,
+    "saved_at": (int, float),
+}
+
+# Optional fields with defaults
+OPTIONAL_META_FIELDS = {
+    "uptime": 0.0,
+    "schema_version": SCHEMA_VERSION,
+    "checksum": "",
+}
 
 
 def _app_root():
@@ -40,6 +120,65 @@ MAX_BACKUPS = 10
 # over the preserved state until the user explicitly opts in.
 _SAVE_LOCKED = False
 _LOCK_REASON = ""
+
+
+def _compute_checksum(data: Dict[str, Any]) -> str:
+    """Compute a checksum for data integrity verification."""
+    # Remove checksum field before computing
+    data_copy = {k: v for k, v in data.items() if k != "checksum"}
+    json_str = json.dumps(data_copy, sort_keys=True, default=str)
+    return hashlib.sha256(json_str.encode()).hexdigest()[:16]
+
+
+def _validate_meta(meta: Dict[str, Any]) -> tuple[bool, str]:
+    """Validate meta.json structure and types.
+    
+    Returns: (is_valid, error_message)
+    """
+    # Check required fields
+    for field, expected_type in REQUIRED_META_FIELDS.items():
+        if field not in meta:
+            return False, f"Missing required field: {field}"
+        if not isinstance(meta[field], expected_type):
+            return False, f"Invalid type for {field}: expected {expected_type.__name__}, got {type(meta[field]).__name__}"
+    
+    # Validate neuromodulators structure
+    nm = meta.get("neuromodulators", {})
+    required_nm = ["dopamine", "serotonin", "norepinephrine", "acetylcholine"]
+    for nm_field in required_nm:
+        if nm_field not in nm:
+            return False, f"Missing neuromodulator: {nm_field}"
+        if not isinstance(nm[nm_field], (int, float)):
+            return False, f"Invalid type for {nm_field}: expected number"
+    
+    # Validate checksum if present
+    if "checksum" in meta and meta["checksum"]:
+        expected = _compute_checksum(meta)
+        if meta["checksum"] != expected:
+            return False, "Checksum mismatch - data may be corrupted"
+    
+    return True, ""
+
+
+def _sanitize_meta(meta: Dict[str, Any]) -> Dict[str, Any]:
+    """Sanitize and normalize meta data."""
+    # Add defaults for optional fields
+    for field, default in OPTIONAL_META_FIELDS.items():
+        if field not in meta:
+            meta[field] = default
+    
+    # Ensure numeric fields are within reasonable bounds
+    meta["step_count"] = max(0, int(meta.get("step_count", 0)))
+    meta["total_neurons"] = max(1, int(meta.get("total_neurons", 1)))
+    meta["uptime"] = max(0.0, float(meta.get("uptime", 0.0)))
+    
+    # Clamp neuromodulator values to [0, 1]
+    if "neuromodulators" in meta:
+        for nm in ["dopamine", "serotonin", "norepinephrine", "acetylcholine"]:
+            if nm in meta["neuromodulators"]:
+                meta["neuromodulators"][nm] = max(0.0, min(1.0, float(meta["neuromodulators"][nm])))
+    
+    return meta
 
 
 def is_save_locked():
@@ -213,7 +352,11 @@ def save_brain(brain, path=None, force=False):
         "neuromodulators": brain.neuromodulators,
         "saved_at": time.time(),
         "uptime": time.time() - brain.start_time,
+        "schema_version": SCHEMA_VERSION,
     }
+    
+    # Add checksum for integrity verification
+    state["checksum"] = _compute_checksum(state)
 
     # Save metadata
     with open(os.path.join(path, "meta.json"), "w") as f:
@@ -285,6 +428,31 @@ def load_brain(brain, path=None):
     try:
         with open(meta_path, "r") as f:
             meta = json.load(f)
+        
+        # Validate schema
+        is_valid, error_msg = _validate_meta(meta)
+        if not is_valid:
+            print(f"[PERSIST] Schema validation failed: {error_msg}")
+            print("[PERSIST] *** SAVE LOCKED *** Corrupted state will NOT be overwritten.")
+            _SAVE_LOCKED = True
+            _LOCK_REASON = f"Schema validation failed: {error_msg}"
+            return False
+        
+        # Sanitize/normalize the data
+        meta = _sanitize_meta(meta)
+        
+        # P1: Migrate schema if needed
+        try:
+            if meta.get("schema_version", "1.0.0") != SCHEMA_VERSION:
+                print(f"[PERSIST] Migrating schema from {meta.get('schema_version', '1.0.0')} to {SCHEMA_VERSION}")
+                meta = migrate_schema(meta, SCHEMA_VERSION)
+                print(f"[PERSIST] Schema migration complete")
+        except ValueError as e:
+            print(f"[PERSIST] Schema migration failed: {e}")
+            print(f"[PERSIST] *** SAVE LOCKED *** Cannot load state with incompatible schema.")
+            _SAVE_LOCKED = True
+            _LOCK_REASON = f"Schema migration failed: {e}"
+            return False
 
         # Verify compatibility
         if meta["total_neurons"] != brain.total_neurons:

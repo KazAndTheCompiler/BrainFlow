@@ -5,25 +5,51 @@ This is a Model Context Protocol (MCP) server that exposes the brain's
 capabilities as tools Claude can use automatically.
 
 The brain must be running (start.bat) for this to work.
+
+SECURITY: Set NEUROLINKED_API_TOKEN environment variable for authentication.
 """
 
 import json
+import os
 import sys
 import urllib.request
 import urllib.error
 import urllib.parse
 
-BRAIN_URL = "http://localhost:8000"
+BRAIN_URL = os.environ.get("NEUROLINKED_URL", "http://localhost:8000")
 MAX_RETRIES = 3
 RETRY_DELAY = 2  # seconds between retries
 
 
+def get_api_token():
+    """Get API token from environment variable."""
+    return os.environ.get("NEUROLINKED_API_TOKEN", "")
+
+
+def is_auth_required():
+    """Check if authentication is required."""
+    return os.environ.get("NEUROLINKED_REQUIRE_AUTH", "true").lower() == "true"
+
+
 def make_request(path, method="GET", data=None):
-    """Make HTTP request to the brain server with retry logic."""
+    """Make HTTP request to the brain server with retry logic and auth."""
     import time
 
     url = f"{BRAIN_URL}{path}"
     headers = {"Content-Type": "application/json"}
+    
+    # Add authorization header if token is configured
+    token = get_api_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    elif is_auth_required():
+        return {
+            "error": "Authentication required. Set NEUROLINKED_API_TOKEN environment variable.\n\n"
+                     "Generate a token:\n"
+                     "  python -c \"import secrets; print(secrets.token_urlsafe(32))\"\n\n"
+                     "Then set it:\n"
+                     "  export NEUROLINKED_API_TOKEN=your_token_here"
+        }
 
     if data:
         body = json.dumps(data).encode("utf-8")
@@ -37,13 +63,32 @@ def make_request(path, method="GET", data=None):
             req = req_factory()
             with urllib.request.urlopen(req, timeout=120) as resp:
                 return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                return {
+                    "error": "Authentication failed. Check your NEUROLINKED_API_TOKEN.\n\n"
+                             "The server rejected your credentials."
+                }
+            elif e.code == 403:
+                return {
+                    "error": "Access forbidden. Your token may be invalid or expired."
+                }
+            elif e.code == 429:
+                return {
+                    "error": "Rate limit exceeded. Please wait before making more requests."
+                }
+            last_error = e
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+                continue
+            return {"error": f"HTTP Error {e.code}: {e.reason}"}
         except urllib.error.URLError as e:
             last_error = e
             if attempt < MAX_RETRIES - 1:
                 time.sleep(RETRY_DELAY)
                 continue
             return {
-                "error": "Cannot connect to NeuroLinked Brain at http://localhost:8000. "
+                "error": f"Cannot connect to NeuroLinked Brain at {BRAIN_URL}. "
                          "Make sure the brain is running first!\n\n"
                          "  Windows:  double-click start.bat\n"
                          "  Mac/Linux: ./start.sh\n\n"

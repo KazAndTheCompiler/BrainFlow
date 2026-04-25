@@ -1,0 +1,116 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brainflow"
+version = "1.0.0"
+description = "NeuroLinked Brain - Neuromorphic brain simulation with FastAPI and Three.js"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "KazAndTheCompiler"}
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.23.0",
+    "websockets>=11.0",
+    "python-multipart>=0.0.6",
+    "pillow>=10.0.0",
+    "opencv-python>=4.8.0",
+    "pyaudio>=0.2.13",
+    "pyautogui>=0.9.54",
+    "pytesseract>=0.3.10",
+    "mss>=9.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "pytest-asyncio>=0.21.0",
+    "black>=23.7.0",
+    "flake8>=6.1.0",
+    "mypy>=1.5.0",
+    "bandit>=1.7.5",
+    "safety>=2.3.0",
+]
+build = [
+    "pyinstaller>=5.13.0",
+]
+
+[project.scripts]
+brainflow = "run:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["brain*", "sensory*"]
+exclude = ["tests*", "dashboard*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+[tool.black]
+line-length = 100
+target-version = ['py310', 'py311', 'py312']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+)/
+'''
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
+
+[tool.bandit]
+exclude_dirs = ["tests"]
+skips = ["B101", "B601"]  # assert_used, shell=True
+
+[tool.coverage.run]
+source = ["brain", "sensory"]
+omit = ["*/tests/*", "*/test_*.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]

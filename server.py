@@ -7,15 +7,26 @@ Provides Claude integration API for reading brain state and sending input.
 
 import asyncio
 import json
+import logging
 import os
 import sys
 import threading
 import time
+from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends, status
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+# Configure structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("brainflow")
 
 from brain.brain import Brain
 from brain.config import BrainConfig
@@ -33,12 +44,181 @@ from sensory.screen_ui import ScreenUIEngine
 
 app = FastAPI(title="NeuroLinked Brain", version="1.0.0")
 
+# Security: Use configured CORS origins instead of wildcard
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=BrainConfig.CORS_ORIGINS,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Requested-With"],
+    allow_credentials=True,
 )
+
+# Security headers middleware
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Add security headers to all responses."""
+    response = await call_next(request)
+    # Prevent MIME type sniffing
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    # Prevent clickjacking
+    response.headers["X-Frame-Options"] = "DENY"
+    # XSS protection
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    # Content Security Policy
+    response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws: wss:;"
+    # Strict Transport Security (only in production)
+    if BrainConfig.is_production():
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+# Global auth middleware - protects ALL routes except allow-listed ones
+@app.middleware("http")
+async def global_auth(request: Request, call_next):
+    """
+    Global authentication middleware.
+    
+    All routes require authentication EXCEPT:
+    - / (index page)
+    - /css/*, /js/* (static assets)
+    - /api/health (health check)
+    - /api/version (version info)
+    - /metrics (prometheus metrics)
+    
+    WebSocket /ws is handled separately in the WS handler.
+    """
+    if not BrainConfig.REQUIRE_AUTH:
+        return await call_next(request)
+    
+    path = request.url.path
+    
+    # Allow-list: paths that don't require authentication
+    PUBLIC_PATHS = [
+        "/",
+        "/api/health",
+        "/api/version",
+        "/metrics",
+    ]
+    
+    # Static assets
+    if path.startswith("/css/") or path.startswith("/js/"):
+        return await call_next(request)
+    
+    # Check if path is public
+    if path in PUBLIC_PATHS:
+        return await call_next(request)
+    
+    # WebSocket is handled separately
+    if path == "/ws":
+        return await call_next(request)
+    
+    # Check for Authorization header
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return JSONResponse(
+            {"error": "Authentication required", "detail": "Missing or invalid Authorization header"},
+            status_code=401
+        )
+    
+    token = auth_header[7:]  # Remove "Bearer " prefix
+    if not BrainConfig.validate_token(token):
+        return JSONResponse(
+            {"error": "Authentication failed", "detail": "Invalid or expired token"},
+            status_code=403
+        )
+    
+    return await call_next(request)
+
+# Auth setup
+security = HTTPBearer(auto_error=False)
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify Bearer token for protected endpoints."""
+    if not BrainConfig.REQUIRE_AUTH:
+        return True
+    
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Authorization header required")
+    
+    token = credentials.credentials
+    if not BrainConfig.validate_token(token):
+        raise HTTPException(status_code=403, detail="Invalid or expired token")
+    
+    return True
+
+# Rate limiting storage (simple in-memory, or Redis for distributed)
+_rate_limit_store = {}
+_redis_client = None
+
+def _get_redis():
+    """Get Redis client if configured."""
+    global _redis_client
+    if _redis_client is None and BrainConfig.REDIS_URL:
+        try:
+            import redis
+            _redis_client = redis.from_url(BrainConfig.REDIS_URL, decode_responses=True)
+            logger.info("Redis rate limiting enabled")
+        except Exception as e:
+            logger.warning(f"Redis connection failed, falling back to in-memory: {e}")
+            _redis_client = False
+    return _redis_client if _redis_client else None
+
+async def rate_limit(request: Request):
+    """Rate limiting middleware with Redis support for distributed deployments."""
+    if not BrainConfig.RATE_LIMIT_ENABLED:
+        return True
+    
+    client_ip = request.client.host if request.client else "unknown"
+    key = f"rate_limit:{client_ip}"
+    
+    # Try Redis first (for distributed rate limiting)
+    redis_client = _get_redis()
+    if redis_client:
+        try:
+            pipe = redis_client.pipeline()
+            now = time.time()
+            window_start = now - BrainConfig.RATE_LIMIT_WINDOW
+            
+            # Remove old entries
+            pipe.zremrangebyscore(key, 0, window_start)
+            # Add current request
+            pipe.zadd(key, {str(now): now})
+            # Count requests in window
+            pipe.zcard(key)
+            # Set expiry on key
+            pipe.expire(key, BrainConfig.RATE_LIMIT_WINDOW)
+            
+            results = pipe.execute()
+            count = results[2]
+            
+            if count > BrainConfig.RATE_LIMIT_REQUESTS:
+                raise HTTPException(status_code=429, detail="Rate limit exceeded")
+            return True
+        except Exception as e:
+            logger.warning(f"Redis rate limit failed, falling back to memory: {e}")
+            # Fall through to in-memory
+    
+    # In-memory rate limiting (per-process only)
+    now = time.time()
+    
+    # Clean old entries
+    for ip in list(_rate_limit_store.keys()):
+        if now - _rate_limit_store[ip]["window_start"] > BrainConfig.RATE_LIMIT_WINDOW:
+            del _rate_limit_store[ip]
+    
+    # Check rate limit
+    if client_ip in _rate_limit_store:
+        data = _rate_limit_store[client_ip]
+        if now - data["window_start"] > BrainConfig.RATE_LIMIT_WINDOW:
+            # New window
+            _rate_limit_store[client_ip] = {"count": 1, "window_start": now}
+        else:
+            data["count"] += 1
+            if data["count"] > BrainConfig.RATE_LIMIT_REQUESTS:
+                raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    else:
+        _rate_limit_store[client_ip] = {"count": 1, "window_start": now}
+    
+    return True
 
 # Global instances
 brain: Brain = None
@@ -55,9 +235,72 @@ sim_running = False
 sim_thread = None
 connected_clients = set()
 
+# WebSocket rate limiting - per-IP reconnect tracking
+_ws_reconnect_tracker = {}
+_WS_RECONNECT_LIMIT = 10  # Max reconnects per window
+_WS_RECONNECT_WINDOW = 60  # Window in seconds
+
+# Brain access lock - protects brain state from race conditions
+# HTTP/WS handlers acquire this; sim thread runs independently
+brain_lock = threading.RLock()
+
+# Async-safe state snapshot for WebSocket broadcasting
+_latest_state_snapshot = None
+_snapshot_lock = asyncio.Lock()
+
 # Auto-save interval (every 5 minutes)
 AUTO_SAVE_INTERVAL = 300
 _last_auto_save = 0
+
+
+def _build_state_snapshot():
+    """
+    Build a complete state snapshot from brain and related systems.
+    
+    This is called from the simulation thread while holding brain_lock.
+    All brain state reads happen here.
+    """
+    snapshot = {
+        "timestamp": time.time(),
+        "brain": None,
+        "claude": None,
+        "screen_observer": None,
+        "video_recorder": None,
+    }
+    
+    if brain:
+        snapshot["brain"] = brain.get_state()
+    
+    if claude_bridge:
+        snapshot["claude"] = {
+            "connected": True,
+            "interactions": claude_bridge._interaction_count,
+        }
+    
+    if screen_observer:
+        snapshot["screen_observer"] = screen_observer.get_state()
+    
+    if video_recorder:
+        snapshot["video_recorder"] = video_recorder.get_state()
+    
+    return snapshot
+
+
+async def _publish_snapshot(snapshot):
+    """
+    Publish state snapshot for HTTP/WS consumers.
+    
+    Called from simulation thread via run_coroutine_threadsafe.
+    """
+    global _latest_state_snapshot
+    async with _snapshot_lock:
+        _latest_state_snapshot = snapshot
+
+
+async def get_latest_snapshot():
+    """Get the latest state snapshot (for HTTP/WS handlers)."""
+    async with _snapshot_lock:
+        return _latest_state_snapshot
 
 
 def init_brain():
@@ -90,6 +333,8 @@ def init_brain():
 _last_screen_log = 0
 _BRAIN_EVENT_LOG_INTERVAL = 15
 SCREEN_LOG_INTERVAL = 30
+_last_knowledge_prune = 0
+KNOWLEDGE_PRUNE_INTERVAL = 3600  # Prune knowledge every hour
 
 def simulation_loop():
     """Run brain simulation in background thread."""
@@ -119,8 +364,8 @@ def simulation_loop():
                             source="brain_monitor",
                             tags=["brain", "monitor", "heartbeat"],
                         )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.error(f"Screen logging failed: {e}", exc_info=True)
                 _last_screen_log = now
 
             if now - _last_brain_event_log > _BRAIN_EVENT_LOG_INTERVAL and claude_bridge:
@@ -133,23 +378,50 @@ def simulation_loop():
                             tags=["brain", "event", event["type"]],
                             metadata={"event_type": event["type"], "step": event["step"]},
                         )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.error(f"Brain event logging failed: {e}", exc_info=True)
                 _last_brain_event_log = now
 
-            brain.step()
+            # Step the brain with lock protection
+            with brain_lock:
+                brain.step()
+                
+                # PUBLISH SNAPSHOT: Build state snapshot while holding lock
+                # This is the ONLY place that reads brain state
+                snapshot = _build_state_snapshot()
+            
+            # Publish snapshot for HTTP/WS consumers (outside lock)
+            asyncio.run_coroutine_threadsafe(
+                _publish_snapshot(snapshot), 
+                asyncio.get_event_loop()
+            )
 
-            # Auto-save periodically
+            # Auto-save periodically (with lock)
             now = time.time()
             if now - _last_auto_save > AUTO_SAVE_INTERVAL:
                 try:
-                    save_brain(brain)
+                    with brain_lock:
+                        save_brain(brain)
                     _last_auto_save = now
+                    logger.info(f"Auto-saved brain at step {brain.step_count}")
                 except Exception as e:
-                    print(f"[SERVER] Auto-save error: {e}")
+                    logger.error(f"Auto-save failed: {e}", exc_info=True)
+            
+            # P1: Prune knowledge store periodically
+            global _last_knowledge_prune
+            if now - _last_knowledge_prune > KNOWLEDGE_PRUNE_INTERVAL:
+                try:
+                    if claude_bridge and claude_bridge.knowledge:
+                        deleted = claude_bridge.knowledge.prune_old_entries()
+                        if deleted > 100:  # Vacuum if significant pruning
+                            claude_bridge.knowledge.vacuum()
+                        _last_knowledge_prune = now
+                        logger.info(f"Pruned {deleted} old knowledge entries")
+                except Exception as e:
+                    logger.error(f"Knowledge pruning failed: {e}", exc_info=True)
 
         except Exception as e:
-            print(f"[SIM] Error: {e}")
+            logger.error(f"Simulation loop error: {e}", exc_info=True)
         elapsed = time.time() - start
         sleep_time = target_dt - elapsed
         if sleep_time > 0:
@@ -164,14 +436,22 @@ def start_simulation():
     sim_running = True
     sim_thread = threading.Thread(target=simulation_loop, daemon=True)
     sim_thread.start()
-    print("[SERVER] Simulation started")
+    logger.info("Simulation started")
 
 
 def stop_simulation():
     """Stop the background simulation thread."""
     global sim_running
     sim_running = False
-    print("[SERVER] Simulation stopped")
+    logger.info("Simulation stop requested")
+    
+    # Wait for thread to finish with timeout
+    if sim_thread and sim_thread.is_alive():
+        sim_thread.join(timeout=5.0)
+        if sim_thread.is_alive():
+            logger.warning("Simulation thread did not stop within timeout")
+        else:
+            logger.info("Simulation stopped cleanly")
 
 
 # --- Static files ---
@@ -196,22 +476,87 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    # Save brain state on shutdown
-    try:
-        save_brain(brain)
-        print("[SERVER] Brain saved on shutdown")
-    except Exception as e:
-        print(f"[SERVER] Save on shutdown failed: {e}")
-
+    logger.info("Shutdown initiated...")
+    
+    # Stop simulation first
     stop_simulation()
+    
+    # Save brain state on shutdown (with lock protection)
+    try:
+        if brain:
+            with brain_lock:
+                save_brain(brain)
+            logger.info("Brain saved on shutdown")
+    except Exception as e:
+        logger.error(f"Save on shutdown failed: {e}", exc_info=True)
+
+    # Stop all encoders/observers
     if screen_observer:
-        screen_observer.stop()
+        try:
+            screen_observer.stop()
+            logger.info("Screen observer stopped")
+        except Exception as e:
+            logger.error(f"Screen observer stop failed: {e}")
     if video_recorder:
-        video_recorder.stop()
+        try:
+            video_recorder.stop()
+            logger.info("Video recorder stopped")
+        except Exception as e:
+            logger.error(f"Video recorder stop failed: {e}")
     if vision_encoder:
-        vision_encoder.stop_webcam()
+        try:
+            vision_encoder.stop_webcam()
+            logger.info("Vision encoder stopped")
+        except Exception as e:
+            logger.error(f"Vision encoder stop failed: {e}")
     if audio_encoder:
-        audio_encoder.stop_microphone()
+        try:
+            audio_encoder.stop_microphone()
+            logger.info("Audio encoder stopped")
+        except Exception as e:
+            logger.error(f"Audio encoder stop failed: {e}")
+    
+    logger.info("Shutdown complete")
+
+
+# =============================================================================
+# Metrics Endpoint (P1: Prometheus metrics)
+# =============================================================================
+
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint - no authentication required."""
+    if not BrainConfig.METRICS_ENABLED:
+        raise HTTPException(status_code=404, detail="Metrics not enabled")
+    
+    lines = []
+    
+    # Brain metrics
+    if brain:
+        lines.append(f"# HELP brainflow_steps_total Total brain steps")
+        lines.append(f"# TYPE brainflow_steps_total counter")
+        lines.append(f"brainflow_steps_total {brain.step_count}")
+        
+        lines.append(f"# HELP brainflow_steps_per_second Current simulation rate")
+        lines.append(f"# TYPE brainflow_steps_per_second gauge")
+        lines.append(f"brainflow_steps_per_second {getattr(brain, 'steps_per_second', 0)}")
+        
+        lines.append(f"# HELP brainflow_neuromodulator_level Neuromodulator levels")
+        lines.append(f"# TYPE brainflow_neuromodulator_level gauge")
+        for nm, val in brain.neuromodulators.items():
+            lines.append(f'brainflow_neuromodulator_level{{type="{nm}"}} {val}')
+    
+    # Connection metrics
+    lines.append(f"# HELP brainflow_connected_clients Number of connected WebSocket clients")
+    lines.append(f"# TYPE brainflow_connected_clients gauge")
+    lines.append(f"brainflow_connected_clients {len(connected_clients)}")
+    
+    # Simulation state
+    lines.append(f"# HELP brainflow_simulation_running Is simulation running")
+    lines.append(f"# TYPE brainflow_simulation_running gauge")
+    lines.append(f"brainflow_simulation_running {1 if sim_running else 0}")
+    
+    return "\n".join(lines)
 
 
 # --- Routes ---
@@ -221,22 +566,81 @@ async def index():
     return FileResponse(os.path.join(dashboard_path, "index.html"))
 
 
-@app.get("/api/state")
+# =============================================================================
+# Public Health & Version Endpoints (No Auth Required)
+# =============================================================================
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint - no authentication required."""
+    health = {
+        "status": "healthy",
+        "brain_initialized": brain is not None,
+        "simulation_running": sim_running,
+        "timestamp": time.time(),
+    }
+    if brain:
+        health["brain"] = {
+            "step_count": brain.step_count,
+            "stage": brain.development_stage,
+            "steps_per_second": getattr(brain, "steps_per_second", 0),
+        }
+    return JSONResponse(health)
+
+
+@app.get("/api/version")
+async def version():
+    """Version info endpoint - no authentication required."""
+    return JSONResponse({
+        "version": "1.0.0",
+        "schema_version": "1.0.0",
+        "api_version": "v1",
+        "build": os.environ.get("NEUROLINKED_BUILD", "dev"),
+        "environment": "production" if BrainConfig.is_production() else "development",
+    })
+
+
+# =============================================================================
+# Dashboard API (Protected - Requires Auth via global middleware)
+# =============================================================================
+
+@app.get("/api/state", dependencies=[Depends(rate_limit)])
 async def get_state():
-    return JSONResponse(brain.get_state())
+    """Get current brain state from snapshot (no lock needed)."""
+    try:
+        snapshot = await get_latest_snapshot()
+        if snapshot and snapshot.get("brain"):
+            return JSONResponse(snapshot["brain"])
+        # Fallback: return minimal state if no snapshot yet
+        return JSONResponse({"status": "initializing"})
+    except Exception as e:
+        logger.error(f"Failed to get state: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get brain state")
 
 
-@app.get("/api/positions")
+@app.get("/api/positions", dependencies=[Depends(rate_limit)])
 async def get_positions():
-    return JSONResponse(brain.get_neuron_positions())
+    """Get neuron positions for 3D visualization."""
+    try:
+        with brain_lock:
+            positions = brain.get_neuron_positions()
+        return JSONResponse(positions)
+    except Exception as e:
+        logger.error(f"Failed to get positions: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get neuron positions")
 
 
-@app.post("/api/input/text")
+@app.post("/api/input/text", dependencies=[Depends(rate_limit)])
 async def input_text(data: dict):
+    """Inject text input into the brain."""
     text = data.get("text", "")
-    if text:
+    if not text:
+        raise HTTPException(status_code=400, detail="Text is required")
+    
+    try:
         features = text_encoder.encode(text)
-        brain.inject_sensory_input("text", features)
+        with brain_lock:
+            brain.inject_sensory_input("text", features)
         # Also log to Claude bridge
         if claude_bridge:
             claude_bridge.send_observation({
@@ -244,58 +648,103 @@ async def input_text(data: dict):
                 "content": text,
                 "source": "user",
             })
-    return {"status": "ok", "encoded_dim": len(features) if text else 0}
+        return {"status": "ok", "encoded_dim": len(features)}
+    except Exception as e:
+        logger.error(f"Text input failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to process text input")
 
 
-@app.post("/api/input/vision/start")
+@app.post("/api/input/vision/start", dependencies=[Depends(rate_limit)])
 async def start_vision():
-    success = vision_encoder.start_webcam()
-    return {"status": "started" if success else "unavailable"}
+    """Start webcam vision input."""
+    try:
+        success = vision_encoder.start_webcam()
+        logger.info(f"Vision encoder start: {success}")
+        return {"status": "started" if success else "unavailable"}
+    except Exception as e:
+        logger.error(f"Vision start failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to start vision")
 
 
-@app.post("/api/input/vision/stop")
+@app.post("/api/input/vision/stop", dependencies=[Depends(rate_limit)])
 async def stop_vision():
-    vision_encoder.stop_webcam()
-    return {"status": "stopped"}
+    """Stop webcam vision input."""
+    try:
+        vision_encoder.stop_webcam()
+        logger.info("Vision encoder stopped")
+        return {"status": "stopped"}
+    except Exception as e:
+        logger.error(f"Vision stop failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to stop vision")
 
 
-@app.post("/api/input/audio/start")
+@app.post("/api/input/audio/start", dependencies=[Depends(rate_limit)])
 async def start_audio():
-    success = audio_encoder.start_microphone()
-    return {"status": "started" if success else "unavailable"}
+    """Start microphone audio input."""
+    try:
+        success = audio_encoder.start_microphone()
+        logger.info(f"Audio encoder start: {success}")
+        return {"status": "started" if success else "unavailable"}
+    except Exception as e:
+        logger.error(f"Audio start failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to start audio")
 
 
-@app.post("/api/input/audio/stop")
+@app.post("/api/input/audio/stop", dependencies=[Depends(rate_limit)])
 async def stop_audio():
-    audio_encoder.stop_microphone()
-    return {"status": "stopped"}
+    """Stop microphone audio input."""
+    try:
+        audio_encoder.stop_microphone()
+        logger.info("Audio encoder stopped")
+        return {"status": "stopped"}
+    except Exception as e:
+        logger.error(f"Audio stop failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to stop audio")
 
 
-@app.post("/api/control/pause")
+@app.post("/api/control/pause", dependencies=[Depends(rate_limit)])
 async def pause():
-    stop_simulation()
-    return {"status": "paused"}
+    """Pause brain simulation."""
+    try:
+        stop_simulation()
+        logger.info("Simulation paused")
+        return {"status": "paused"}
+    except Exception as e:
+        logger.error(f"Pause failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to pause simulation")
 
 
-@app.post("/api/control/resume")
+@app.post("/api/control/resume", dependencies=[Depends(rate_limit)])
 async def resume():
-    start_simulation()
-    return {"status": "running"}
+    """Resume brain simulation."""
+    try:
+        start_simulation()
+        logger.info("Simulation resumed")
+        return {"status": "running"}
+    except Exception as e:
+        logger.error(f"Resume failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to resume simulation")
 
 
-@app.post("/api/control/reset")
+@app.post("/api/control/reset", dependencies=[Depends(rate_limit)])
 async def reset():
-    stop_simulation()
-    init_brain()
-    start_simulation()
-    return {"status": "reset"}
+    """Reset brain to initial state."""
+    try:
+        stop_simulation()
+        init_brain()
+        start_simulation()
+        logger.info("Brain reset")
+        return {"status": "reset"}
+    except Exception as e:
+        logger.error(f"Reset failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to reset brain")
 
 
 # =============================================================================
-# Claude Integration API
+# Claude Integration API (Protected - Requires Auth)
 # =============================================================================
 
-@app.get("/api/claude/summary")
+@app.get("/api/claude/summary", dependencies=[Depends(rate_limit)])
 async def claude_summary():
     """Primary endpoint for Claude to read brain state."""
     if not claude_bridge:
@@ -307,7 +756,7 @@ async def claude_summary():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@app.get("/api/claude/insights")
+@app.get("/api/claude/insights", dependencies=[Depends(rate_limit)])
 async def claude_insights():
     """Get brain-derived insights useful for Claude."""
     if not claude_bridge:
@@ -319,7 +768,7 @@ async def claude_insights():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@app.post("/api/claude/observe")
+@app.post("/api/claude/observe", dependencies=[Depends(rate_limit)])
 async def claude_observe(data: dict):
     """
     Claude sends an observation to the brain.
@@ -331,7 +780,7 @@ async def claude_observe(data: dict):
     return {"status": "ok", "interaction_count": claude_bridge._interaction_count}
 
 
-@app.get("/api/claude/status")
+@app.get("/api/claude/status", dependencies=[Depends(rate_limit)])
 async def claude_status():
     """Get Claude bridge connection status."""
     if not claude_bridge:
@@ -344,7 +793,7 @@ async def claude_status():
     return JSONResponse(state)
 
 
-@app.get("/api/claude/activity")
+@app.get("/api/claude/activity", dependencies=[Depends(rate_limit)])
 async def claude_activity():
     """Get recent activity log."""
     if not claude_bridge:
@@ -352,7 +801,7 @@ async def claude_activity():
     return JSONResponse(claude_bridge.get_activity_log())
 
 
-@app.get("/api/claude/learned")
+@app.get("/api/claude/learned", dependencies=[Depends(rate_limit)])
 async def claude_learned():
     """Get what the brain has learned - grouped patterns and associations."""
     if not claude_bridge:
@@ -364,7 +813,7 @@ async def claude_learned():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@app.get("/api/claude/learned/summary")
+@app.get("/api/claude/learned/summary", dependencies=[Depends(rate_limit)])
 async def claude_learned_summary():
     """Get plain-English summary of what the brain has learned."""
     if not claude_bridge:
@@ -380,7 +829,7 @@ async def claude_learned_summary():
 # Knowledge Store API (text storage & retrieval — replaces Obsidian)
 # =============================================================================
 
-@app.get("/api/claude/recall")
+@app.get("/api/claude/recall", dependencies=[Depends(rate_limit)])
 async def claude_recall(q: str = "", limit: int = 10):
     """Recall knowledge about a specific topic."""
     if not claude_bridge:
@@ -394,7 +843,7 @@ async def claude_recall(q: str = "", limit: int = 10):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@app.get("/api/claude/search")
+@app.get("/api/claude/search", dependencies=[Depends(rate_limit)])
 async def claude_search(q: str = "", limit: int = 20):
     """Full-text search across all stored knowledge."""
     if not claude_bridge:
@@ -408,7 +857,7 @@ async def claude_search(q: str = "", limit: int = 20):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@app.get("/api/claude/semantic")
+@app.get("/api/claude/semantic", dependencies=[Depends(rate_limit)])
 async def claude_semantic(q: str = "", limit: int = 10):
     """Semantic (associative) search - finds conceptually related memories
     via TF-IDF cosine similarity, not just keyword matching."""
@@ -424,7 +873,7 @@ async def claude_semantic(q: str = "", limit: int = 10):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@app.get("/api/claude/knowledge")
+@app.get("/api/claude/knowledge", dependencies=[Depends(rate_limit)])
 async def claude_knowledge():
     """Get knowledge store stats and recent entries."""
     if not claude_bridge:
@@ -437,7 +886,7 @@ async def claude_knowledge():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@app.post("/api/claude/remember")
+@app.post("/api/claude/remember", dependencies=[Depends(rate_limit)])
 async def claude_remember(data: dict):
     """
     Store a piece of knowledge directly.
@@ -739,57 +1188,139 @@ async def brain_lock_status():
 
 
 # =============================================================================
-# WebSocket for real-time streaming
+# WebSocket for real-time streaming (AUTHENTICATED)
 # =============================================================================
+
+async def verify_ws_token(ws: WebSocket) -> bool:
+    """Verify authentication token from WebSocket query params or first message."""
+    if not BrainConfig.REQUIRE_AUTH:
+        return True
+    
+    # Try to get token from query parameters
+    token = ws.query_params.get("token", "")
+    
+    if not token:
+        # Try to receive first message as auth handshake
+        try:
+            auth_msg = await asyncio.wait_for(ws.receive_json(), timeout=5.0)
+            if auth_msg.get("type") == "auth":
+                token = auth_msg.get("token", "")
+            else:
+                logger.warning("WS: First message was not auth handshake")
+                return False
+        except asyncio.TimeoutError:
+            logger.warning("WS: Auth handshake timeout")
+            return False
+        except Exception as e:
+            logger.warning(f"WS: Auth handshake error: {e}")
+            return False
+    
+    if not BrainConfig.validate_token(token):
+        logger.warning("WS: Invalid token rejected")
+        return False
+    
+    return True
+
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    # P1: Rate limit WS reconnects per IP
+    client_ip = ws.client.host if ws.client else "unknown"
+    now = time.time()
+    
+    # Clean old entries
+    for ip in list(_ws_reconnect_tracker.keys()):
+        if now - _ws_reconnect_tracker[ip]["window_start"] > _WS_RECONNECT_WINDOW:
+            del _ws_reconnect_tracker[ip]
+    
+    # Check reconnect limit
+    if client_ip in _ws_reconnect_tracker:
+        data = _ws_reconnect_tracker[client_ip]
+        if now - data["window_start"] > _WS_RECONNECT_WINDOW:
+            # New window
+            _ws_reconnect_tracker[client_ip] = {"count": 1, "window_start": now}
+        else:
+            data["count"] += 1
+            if data["count"] > _WS_RECONNECT_LIMIT:
+                await ws.close(code=status.WS_1013_TRY_AGAIN_LATER, reason="Reconnect rate limit exceeded")
+                logger.warning(f"WS: Reconnect rate limit exceeded for {client_ip}")
+                return
+    else:
+        _ws_reconnect_tracker[client_ip] = {"count": 1, "window_start": now}
+    
+    # Authenticate before accepting
+    if not await verify_ws_token(ws):
+        await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="Authentication required")
+        logger.warning("WS: Connection rejected - authentication failed")
+        return
+    
     await ws.accept()
     connected_clients.add(ws)
-    print(f"[WS] Client connected ({len(connected_clients)} total)")
+    logger.info(f"WS: Client connected ({len(connected_clients)} total)")
 
-    # Send initial neuron positions
+    # Send initial neuron positions (with lock protection)
     try:
-        positions = brain.get_neuron_positions()
+        with brain_lock:
+            positions = brain.get_neuron_positions()
         await ws.send_json({"type": "init", "positions": positions})
-    except Exception:
-        pass
+    except Exception as e:
+        logger.error(f"WS: Failed to send initial positions: {e}", exc_info=True)
 
     try:
         update_interval = 1.0 / BrainConfig.WS_UPDATE_RATE
+        last_state_hash = None
+        
         while True:
             start = time.time()
 
-            # Send brain state
-            state = brain.get_state()
-
-            # Add Claude bridge info to state
-            if claude_bridge:
-                state["claude"] = {
-                    "connected": True,
-                    "interactions": claude_bridge._interaction_count,
-                }
-            if screen_observer:
-                state["screen_observer"] = screen_observer.get_state()
-            if video_recorder:
-                state["video_recorder"] = video_recorder.get_state()
-
-            await ws.send_json({"type": "state", "data": state})
+            # Get state snapshot (published by sim thread, no lock needed)
+            try:
+                snapshot = await get_latest_snapshot()
+                if snapshot and snapshot.get("brain"):
+                    state = snapshot["brain"].copy()
+                    
+                    # Add Claude bridge info from snapshot
+                    if snapshot.get("claude"):
+                        state["claude"] = snapshot["claude"]
+                    if snapshot.get("screen_observer"):
+                        state["screen_observer"] = snapshot["screen_observer"]
+                    if snapshot.get("video_recorder"):
+                        state["video_recorder"] = snapshot["video_recorder"]
+                    
+                    # Only send if state changed (simple hash check)
+                    state_hash = hash(json.dumps(state, sort_keys=True, default=str))
+                    if state_hash != last_state_hash:
+                        await ws.send_json({"type": "state", "data": state})
+                        last_state_hash = state_hash
+                    
+            except Exception as e:
+                logger.error(f"WS: Failed to get/send state: {e}", exc_info=True)
 
             # Check for incoming messages (text input, commands)
             try:
                 msg = await asyncio.wait_for(ws.receive_json(), timeout=0.001)
+                
+                # Handle auth message (already authenticated, but allow re-auth)
+                if msg.get("type") == "auth":
+                    continue
+                    
                 if msg.get("type") == "text_input":
-                    features = text_encoder.encode(msg["text"])
-                    brain.inject_sensory_input("text", features)
-                    if claude_bridge:
-                        claude_bridge.send_observation({
-                            "type": "text",
-                            "content": msg["text"],
-                            "source": "dashboard",
-                        })
+                    text = msg.get("text", "")
+                    if text:
+                        features = text_encoder.encode(text)
+                        with brain_lock:
+                            brain.inject_sensory_input("text", features)
+                        if claude_bridge:
+                            claude_bridge.send_observation({
+                                "type": "text",
+                                "content": text,
+                                "source": "dashboard",
+                            })
+                            
                 elif msg.get("type") == "command":
                     cmd = msg.get("cmd")
+                    logger.info(f"WS: Received command: {cmd}")
+                    
                     if cmd == "start_vision":
                         vision_encoder.start_webcam()
                     elif cmd == "stop_vision":
@@ -809,19 +1340,33 @@ async def websocket_endpoint(ws: WebSocket):
                         if video_recorder:
                             video_recorder.stop()
                     elif cmd == "save":
-                        save_brain(brain)
+                        with brain_lock:
+                            save_brain(brain)
+                        logger.info("WS: Brain saved via command")
                     elif cmd == "load":
-                        load_brain(brain)
+                        with brain_lock:
+                            load_brain(brain)
+                        logger.info("WS: Brain loaded via command")
+                    else:
+                        logger.warning(f"WS: Unknown command: {cmd}")
+                        
             except asyncio.TimeoutError:
                 pass
+            except Exception as e:
+                logger.error(f"WS: Error processing message: {e}", exc_info=True)
 
-            # Feed continuous sensory input
-            if vision_encoder.active:
-                vis_features = vision_encoder.capture_frame()
-                brain.inject_sensory_input("vision", vis_features)
-            if audio_encoder.active:
-                aud_features = audio_encoder.capture_audio()
-                brain.inject_sensory_input("audio", aud_features)
+            # Feed continuous sensory input (with lock protection)
+            try:
+                if vision_encoder.active:
+                    vis_features = vision_encoder.capture_frame()
+                    with brain_lock:
+                        brain.inject_sensory_input("vision", vis_features)
+                if audio_encoder.active:
+                    aud_features = audio_encoder.capture_audio()
+                    with brain_lock:
+                        brain.inject_sensory_input("audio", aud_features)
+            except Exception as e:
+                logger.error(f"WS: Sensory input error: {e}", exc_info=True)
 
             # Maintain update rate
             elapsed = time.time() - start
@@ -830,9 +1375,9 @@ async def websocket_endpoint(ws: WebSocket):
                 await asyncio.sleep(sleep_time)
 
     except WebSocketDisconnect:
-        pass
+        logger.info("WS: Client disconnected normally")
     except Exception as e:
-        print(f"[WS] Error: {e}")
+        logger.error(f"WS: Unexpected error: {e}", exc_info=True)
     finally:
         connected_clients.discard(ws)
-        print(f"[WS] Client disconnected ({len(connected_clients)} total)")
+        logger.info(f"WS: Client disconnected ({len(connected_clients)} total)")

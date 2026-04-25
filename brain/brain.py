@@ -28,7 +28,7 @@ class Brain:
         self.start_time = time.time()
 
         # Dedicated RNG for spontaneous baseline activity (thread-safe, reproducible)
-        self._rng = np.random.default_rng()
+        self._rng = BrainConfig.get_rng()
 
         # Create all brain regions
         print("[BRAIN] Creating brain regions...")
@@ -295,12 +295,13 @@ class Brain:
     def get_neuron_positions(self) -> dict:
         """Get 3D positions for all neurons (for initial visualization setup)."""
         positions = {}
+        rng = BrainConfig.get_rng()
         for name, region in self.regions.items():
             n = region.n_neurons
             center = region.position
             # Distribute neurons in a cloud around the region center
             spread = 0.15 + (n / self.total_neurons) * 0.3
-            pos = np.random.randn(n, 3) * spread + center
+            pos = rng.standard_normal((n, 3)) * spread + center
             positions[name] = {
                 "center": center.tolist(),
                 "count": n,

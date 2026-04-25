@@ -22,8 +22,11 @@ class ClaudeBridge:
     """Interface between Claude and the neuromorphic brain."""
 
     def __init__(self, brain):
+        from brain.config import BrainConfig
+        
         self.brain = brain
-        self._activity_log = deque(maxlen=1000)
+        # P1: Configurable retention limits
+        self._activity_log = deque(maxlen=BrainConfig.ACTIVITY_LOG_MAX_ENTRIES)
         self._claude_inputs = deque(maxlen=100)
         self._decoded_outputs = deque(maxlen=100)
         self._session_start = time.time()
@@ -147,16 +150,46 @@ class ClaudeBridge:
     def recall(self, query: str, limit: int = 10) -> list:
         """Recall knowledge about a topic. Uses semantic search (TF-IDF + cosine)
         for real associative memory — finds conceptually related memories,
-        not just exact keyword matches."""
+        not just exact keyword matches.
+        
+        P1: Prompt injection defense - screen-observed content is tagged as untrusted
+        and wrapped with framing when retrieved.
+        """
         # Try semantic search first (real associative memory)
         try:
             results = self.knowledge.semantic_search(query, limit=limit)
             if results:
-                return results
+                return self._apply_trust_framing(results)
         except Exception as e:
             print(f"[BRIDGE] Semantic search error: {e}")
         # Fallback to keyword-based recall
-        return self.knowledge.recall(query, limit=limit)
+        results = self.knowledge.recall(query, limit=limit)
+        return self._apply_trust_framing(results)
+    
+    def _apply_trust_framing(self, results: list) -> list:
+        """
+        P1: Prompt injection defense.
+        
+        Wraps untrusted content (screen observations) with framing tags
+        to prevent prompt injection attacks via recalled knowledge.
+        """
+        framed_results = []
+        for result in results:
+            source = result.get("source", "unknown")
+            text = result.get("text", "")
+            
+            # Screen-observed content is untrusted
+            if source in ("screen", "screen_ui", "screen_observer"):
+                result["text"] = f"<untrusted-input source=\"screen\">{text}</untrusted-input>"
+                result["trust_level"] = "untrusted"
+            elif source in ("claude", "user"):
+                result["trust_level"] = "trusted"
+            else:
+                result["trust_level"] = "unknown"
+            
+            framed_results.append(result)
+        
+        return framed_results
 
     def search_knowledge(self, query: str, limit: int = 20) -> list:
         """Full-text search across all stored knowledge."""

@@ -3,10 +3,27 @@ NeuroLinked Brain Configuration
 All hyperparameters for the neuromorphic brain system.
 """
 
+import os
+import secrets
 import numpy as np
 
 
 class BrainConfig:
+    # --- Determinism / RNG Seeding ---
+    # Set NEUROLINKED_SEED for reproducible runs (testing, debugging)
+    # Leave unset for random initialization
+    RNG_SEED = os.environ.get("NEUROLINKED_SEED", None)
+    
+    @classmethod
+    def get_rng(cls):
+        """Get a seeded numpy random Generator for reproducibility."""
+        if cls.RNG_SEED is not None:
+            try:
+                seed = int(cls.RNG_SEED)
+                return np.random.default_rng(seed)
+            except (ValueError, TypeError):
+                pass
+        return np.random.default_rng()
     # --- Scale ---
     TOTAL_NEURONS = 100_000  # Default 100K, set to 1_000_000 for full scale
     SYNAPSES_PER_NEURON = 1200  # Average connections per neuron
@@ -111,3 +128,100 @@ class BrainConfig:
     HOST = "0.0.0.0"
     PORT = 8000
     WS_UPDATE_RATE = 30  # Hz
+
+    # --- Security (Production-Grade) ---
+    # SECURITY WARNING: These defaults are for development only.
+    # In production, ALWAYS set NEUROLINKED_API_TOKEN via environment variable.
+    
+    # Master API token for MCP server and HTTP API authentication
+    # Generate a secure token with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+    API_TOKEN = os.environ.get("NEUROLINKED_API_TOKEN", "")
+    
+    # Token file path (alternative to env var)
+    TOKEN_FILE = os.environ.get("NEUROLINKED_TOKEN_FILE", "")
+    
+    # Require authentication for all API endpoints (except health check)
+    REQUIRE_AUTH = os.environ.get("NEUROLINKED_REQUIRE_AUTH", "true").lower() == "true"
+    
+    # CORS origins (production: restrict to your domain)
+    CORS_ORIGINS = os.environ.get("NEUROLINKED_CORS_ORIGINS", "http://localhost:8000").split(",")
+    
+    # Rate limiting
+    RATE_LIMIT_ENABLED = os.environ.get("NEUROLINKED_RATE_LIMIT", "true").lower() == "true"
+    RATE_LIMIT_REQUESTS = int(os.environ.get("NEUROLINKED_RATE_LIMIT_REQUESTS", "100"))
+    RATE_LIMIT_WINDOW = int(os.environ.get("NEUROLINKED_RATE_LIMIT_WINDOW", "60"))
+    
+    # Bind address (production: bind to localhost only or use unix socket)
+    HOST = os.environ.get("NEUROLINKED_HOST", "127.0.0.1")
+    PORT = int(os.environ.get("NEUROLINKED_PORT", "8000"))
+    
+    @classmethod
+    def get_api_token(cls) -> str:
+        """Get API token from env var or token file."""
+        if cls.API_TOKEN:
+            return cls.API_TOKEN
+        if cls.TOKEN_FILE and os.path.exists(cls.TOKEN_FILE):
+            try:
+                with open(cls.TOKEN_FILE, 'r') as f:
+                    return f.read().strip()
+            except Exception:
+                pass
+        return ""
+    
+    @classmethod
+    def generate_secure_token(cls) -> str:
+        """Generate a new secure API token."""
+        return secrets.token_urlsafe(32)
+    
+    @classmethod
+    def is_production(cls) -> bool:
+        """Check if running in production mode."""
+        return os.environ.get("NEUROLINKED_ENV", "development").lower() == "production"
+    
+    @classmethod
+    def validate_token(cls, token: str) -> bool:
+        """Validate an API token against the configured token."""
+        expected = cls.get_api_token()
+        if not expected:
+            # No token configured - reject all requests in production
+            return not cls.is_production()
+        # Use constant-time comparison to prevent timing attacks
+        return secrets.compare_digest(token, expected)
+    
+    # --- P1: Knowledge Store Retention ---
+    # Maximum entries in knowledge store (oldest auto-pruned)
+    KNOWLEDGE_MAX_ENTRIES = int(os.environ.get("NEUROLINKED_KNOWLEDGE_MAX_ENTRIES", "10000"))
+    
+    # Knowledge retention days (entries older than this are pruned)
+    KNOWLEDGE_RETENTION_DAYS = int(os.environ.get("NEUROLINKED_KNOWLEDGE_RETENTION_DAYS", "90"))
+    
+    # --- P1: Screen Observer Privacy ---
+    # Window titles to exclude from screen capture (privacy filter)
+    SCREEN_EXCLUDED_TITLES = os.environ.get(
+        "NEUROLINKED_SCREEN_EXCLUDED_TITLES",
+        "password,pass,secret,login,credential,bitwarden,1password,lastpass,dashlane"
+    ).lower().split(",")
+    
+    # Text patterns to redact from OCR (PII protection)
+    SCREEN_REDACT_PATTERNS = [
+        r'\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b',  # Credit cards
+        r'\b\d{3}-\d{2}-\d{4}\b',  # SSN
+        r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',  # Emails
+        r'password[:\s]+\S+',  # Password fields
+        r'secret[:\s]+\S+',  # Secret fields
+        r'token[:\s]+\S+',  # Token fields
+        r'key[:\s]+\S+',  # Key fields
+    ]
+    
+    # --- P1: Rate Limiting Backend ---
+    # Use Redis for distributed rate limiting (empty = in-memory)
+    REDIS_URL = os.environ.get("NEUROLINKED_REDIS_URL", "")
+    
+    # --- P1: Activity Log Retention ---
+    # Maximum activity log entries (ClaudeBridge)
+    ACTIVITY_LOG_MAX_ENTRIES = int(os.environ.get("NEUROLINKED_ACTIVITY_LOG_MAX", "1000"))
+    
+    # --- P1: Metrics ---
+    # Enable Prometheus metrics endpoint
+    METRICS_ENABLED = os.environ.get("NEUROLINKED_METRICS_ENABLED", "false").lower() == "true"
+    METRICS_PORT = int(os.environ.get("NEUROLINKED_METRICS_PORT", "9090"))

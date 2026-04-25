@@ -646,3 +646,67 @@ class KnowledgeStore:
             return f"{int(age / 3600)}h ago"
         else:
             return f"{int(age / 86400)}d ago"
+
+    def prune_old_entries(self, max_entries: int = None, retention_days: int = None) -> int:
+        """
+        Prune old knowledge entries to prevent unbounded growth.
+        
+        Args:
+            max_entries: Keep only the N most recent entries (from BrainConfig)
+            retention_days: Delete entries older than N days (from BrainConfig)
+            
+        Returns:
+            Number of entries deleted
+        """
+        from brain.config import BrainConfig
+        
+        if max_entries is None:
+            max_entries = BrainConfig.KNOWLEDGE_MAX_ENTRIES
+        if retention_days is None:
+            retention_days = BrainConfig.KNOWLEDGE_RETENTION_DAYS
+            
+        deleted_count = 0
+        cutoff_time = time.time() - (retention_days * 86400)
+        
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, timeout=30)
+            c = conn.cursor()
+            
+            # Delete entries older than retention period
+            c.execute(
+                "DELETE FROM knowledge WHERE timestamp < ?",
+                (cutoff_time,)
+            )
+            deleted_count += c.rowcount
+            
+            # If still over max_entries, delete oldest
+            c.execute("SELECT COUNT(*) FROM knowledge")
+            total = c.fetchone()[0]
+            
+            if total > max_entries:
+                to_delete = total - max_entries
+                c.execute("""
+                    DELETE FROM knowledge 
+                    WHERE id IN (
+                        SELECT id FROM knowledge 
+                        ORDER BY timestamp ASC 
+                        LIMIT ?
+                    )
+                """, (to_delete,))
+                deleted_count += c.rowcount
+            
+            conn.commit()
+            conn.close()
+        
+        if deleted_count > 0:
+            logger.info(f"Pruned {deleted_count} old knowledge entries")
+        
+        return deleted_count
+
+    def vacuum(self):
+        """Compact the database to reclaim space after pruning."""
+        with self._lock:
+            conn = sqlite3.connect(self.db_path, timeout=30)
+            conn.execute("VACUUM")
+            conn.close()
+            logger.info("Knowledge store vacuumed")
